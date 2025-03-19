@@ -197,14 +197,27 @@ fn run_pulumi_new_from_template(
         (ProjectType::App | ProjectType::Service, PulumiProjectRuntime::Typescript) => "app-ts",
         _ => panic!("unsupported runtime for this project type"),
     };
+    let template_path = get_pulumi_dir()?.join("templates").join(template_dir);
+    if runtime == &PulumiProjectRuntime::Typescript {
+        info!(
+            "removing node_modules dir at {}",
+            template_path
+                .join("node_modules")
+                .to_str()
+                .expect("getting node_modules dir")
+        );
+        // remove the node_modules dir if it exists
+        if template_path.join("node_modules").exists() {
+            fs::remove_dir_all(template_path.join("node_modules")).expect("removing node_modules");
+        }
+    }
     let opts = project_opts.join(" ");
     info!("extra pulumi options added: {}", &opts.bright_purple());
     let cmd = &format!(
-        r#"pulumi new {3}/templates/{2} --dir {0} -d "pulumi project for {1}" --name "{1}"  --stack mysten/dev {4}"#,
+        r#"pulumi new {2} --dir {0} -d "pulumi project for {1}" --name "{1}"  --stack mysten/dev {3}"#,
         project_dir_str,
         project_name,
-        template_dir,
-        get_pulumi_dir()?
+        template_path
             .to_str()
             .expect("getting pulumi dir for template"),
         opts,
