@@ -142,7 +142,7 @@ pub struct ImageBuildArgs {
 #[derive(Parser, Debug)]
 pub struct ImageQueryArgs {
     #[arg(short, long)]
-    repo_name: String,
+    repo_name: Option<String>,
     #[arg(short, long)]
     watch: bool,
     #[arg(short, long)]
@@ -199,8 +199,9 @@ struct RequestBuildRequest {
 
 #[derive(serde::Serialize)]
 struct QueryBuildsRequest {
-    repo_name: String,
+    repo_name: Option<String>,
     limit: u32,
+    show_running_only: bool,
 }
 #[derive(serde::Serialize)]
 struct ImageStatusRequest {
@@ -314,20 +315,37 @@ struct ImageListResponse {
     pub images: Vec<ImageDetails>,
 }
 
-async fn get_status_table(resp: reqwest::Response) -> Result<tabled::Table> {
-    let json_resp = resp.json::<QueryBuildResponse>().await?;
-    let job_statuses = json_resp.pods.into_iter().map(|pod| {
-        // Parse the string into a NaiveDateTime
-        let start_time = utc_to_local_time(pod.start_time);
-        let end_time = utc_to_local_time(pod.end_time.unwrap_or("".to_string()));
+struct GetStatusTableArgs {
+    show_running_only: bool,
+}
 
-        BuildInfo {
-            name: pod.name,
-            status: pod.status,
-            start_time,
-            end_time,
-        }
-    });
+async fn get_status_table(
+    resp: reqwest::Response,
+    args: &GetStatusTableArgs,
+) -> Result<tabled::Table> {
+    let json_resp = resp.json::<QueryBuildResponse>().await?;
+    let job_statuses = json_resp
+        .pods
+        .into_iter()
+        .map(|pod| {
+            // Parse the string into a NaiveDateTime
+            let start_time = utc_to_local_time(pod.start_time);
+            let end_time = utc_to_local_time(pod.end_time.unwrap_or("".to_string()));
+
+            BuildInfo {
+                name: pod.name,
+                status: pod.status,
+                start_time,
+                end_time,
+            }
+        })
+        .filter(|build| {
+            if args.show_running_only {
+                build.status == "Running"
+            } else {
+                true
+            }
+        });
     let mut tabled = Table::new(job_statuses);
     Ok(tabled.with(Style::rounded()).to_owned())
 }
@@ -375,9 +393,19 @@ pub async fn send_image_request(token: &str, action: &ImageAction) -> Result<()>
                 );
             }
             ImageAction::Query(args) => {
+                let get_status_args = if let Some(repo_name) = &args.repo_name {
+                    println!("Requested query for repo: {}", repo_name.green());
+                    GetStatusTableArgs {
+                        show_running_only: false,
+                    }
+                } else {
+                    println!("Querying all running builds");
+                    GetStatusTableArgs {
+                        show_running_only: true,
+                    }
+                };
                 if !args.watch {
-                    println!("Requested query for repo: {}", args.repo_name.green());
-                    let status_table = get_status_table(resp).await?.to_string();
+                    let status_table = get_status_table(resp, &get_status_args).await?.to_string();
                     println!("{}", status_table);
                 } else {
                     enable_raw_mode()?;
@@ -391,7 +419,7 @@ pub async fn send_image_request(token: &str, action: &ImageAction) -> Result<()>
                                 let req = generate_image_request(token, action);
 
                                 let resp = req.send().await?;
-                                let status_table = get_status_table(resp).await?.to_string();
+                                let status_table = get_status_table(resp, &get_status_args).await?.to_string();
                                 std::io::stdout().execute(Clear(ClearType::All))?.execute(MoveTo(0,0))?;
                                 print!("press 'q' or 'esc' to quit");
                                 for (i, line )in status_table.lines().enumerate() {
@@ -575,6 +603,7 @@ fn generate_image_request(token: &str, action: &ImageAction) -> reqwest::Request
             let query = QueryBuildsRequest {
                 repo_name: args.repo_name.clone(),
                 limit,
+                show_running_only: args.repo_name.is_none(),
             };
             req.query(&query).headers(generate_headers_with_auth(token))
         }
