@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, info};
 
 const CHANNELS_URL: &str = "https://slack.com/api/conversations.list";
 
@@ -18,6 +18,7 @@ const CHANNELS_URL: &str = "https://slack.com/api/conversations.list";
 pub struct UsersResponse {
     ok: bool,
     members: Option<Vec<SlackUser>>,
+    response_metadata: Option<ResponseMetadata>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -115,18 +116,57 @@ pub async fn get_channels(client: &Client) -> Result<Vec<Channel>> {
 
 pub async fn get_users(client: &Client) -> Result<Vec<SlackUser>> {
     let url = "https://slack.com/api/users.list";
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| anyhow!(e))?
-        .json::<UsersResponse>()
-        .await?;
+    let mut all_users = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut has_more = true;
 
-    if !response.ok {
-        panic!("Failed to get users");
+    while has_more {
+        let mut request = client.get(url);
+
+        if let Some(ref cursor_value) = cursor {
+            request = request.query(&[("cursor", cursor_value)]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?
+            .json::<UsersResponse>()
+            .await?;
+
+        if !response.ok {
+            return Err(anyhow::anyhow!("Failed to get users: API returned not OK"));
+        }
+
+        if let Some(members) = response.members {
+            if *crate::DEBUG_MODE {
+                info!("Retrieved {} users from Slack API", members.len());
+            }
+            all_users.extend(members);
+        }
+
+        // Check if there are more results
+        if let Some(metadata) = response.response_metadata {
+            if let Some(next_cursor) = metadata.next_cursor {
+                if !next_cursor.is_empty() {
+                    cursor = Some(next_cursor);
+                    has_more = true;
+                } else {
+                    has_more = false;
+                }
+            } else {
+                has_more = false;
+            }
+        } else {
+            has_more = false;
+        }
     }
-    response.members.ok_or(anyhow::anyhow!("missing members"))
+
+    if *crate::DEBUG_MODE {
+        info!("Total users retrieved from Slack: {}", all_users.len());
+    }
+
+    Ok(all_users)
 }
 
 pub async fn send_message(client: &Client, channel: &str, message: &str) -> Result<()> {

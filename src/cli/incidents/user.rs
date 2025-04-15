@@ -26,6 +26,18 @@ impl User {
             })
         }
     }
+
+    /// Returns a string indicating which systems this user exists in
+    pub fn system_presence(&self) -> String {
+        let mut presence = Vec::new();
+        if self.slack_user.is_some() {
+            presence.push("Slack");
+        }
+        if self.notion_user.is_some() {
+            presence.push("Notion");
+        }
+        presence.join(" & ")
+    }
 }
 
 impl Display for User {
@@ -45,15 +57,16 @@ impl Display for User {
             })
             .or_else(|| self.notion_user.as_ref().map(|u| u.name.clone()));
         if let Some(name) = name {
-            write!(f, "{}", name)
+            write!(f, "{} [{}]", name, self.system_presence())
         } else {
             write!(
                 f,
-                "{}",
+                "{} [{}]",
                 self.notion_user
                     .as_ref()
                     .expect("expected notion user")
-                    .name
+                    .name,
+                self.system_presence()
             )
         }
     }

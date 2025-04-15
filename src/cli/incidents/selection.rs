@@ -5,7 +5,7 @@ use anyhow::Result;
 use inquire::{Confirm, MultiSelect};
 use std::collections::HashMap;
 use strsim::normalized_damerau_levenshtein;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::cli::incidents::notion::{Notion, INCIDENT_DB_ID, INCIDENT_DB_NAME};
 use crate::cli::incidents::user::User;
@@ -45,26 +45,132 @@ fn filter_incidents_for_review(incidents: Vec<Incident>, min_priority: &str) -> 
         .collect()
 }
 
+/// Normalizes an email address for comparison by converting to lowercase and trimming whitespace
+fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Compares two email addresses after normalization
+fn emails_match(email1: &str, email2: &str) -> bool {
+    let normalized1 = normalize_email(email1);
+    let normalized2 = normalize_email(email2);
+    normalized1 == normalized2
+}
+
 pub async fn review_recent_incidents(incidents: Vec<Incident>) -> Result<()> {
     let slack = Slack::new().await;
     let notion = Notion::new();
-    let combined_users = notion
-        .get_all_people()
-        .await?
+
+    if *DEBUG_MODE {
+        info!("Retrieved {} users from Slack", slack.users.len());
+    }
+
+    let notion_people = notion.get_all_people().await?;
+
+    if *DEBUG_MODE {
+        info!("Retrieved {} people from Notion", notion_people.len());
+    }
+
+    let combined_users = notion_people
         .into_iter()
         .map(|nu| {
-            let slack_user = slack.users.iter().find(|su| {
-                su.profile
-                    .as_ref()
-                    .unwrap()
-                    .email
-                    .as_ref()
-                    .unwrap_or(&"".to_owned())
-                    == &nu.person.email
-            });
-            User::new(slack_user.cloned(), Some(nu)).expect("Failed to convert user from Notion")
+            let notion_email = nu.person.as_ref().map(|p| &p.email);
+            let slack_user = if let Some(email) = notion_email {
+                slack.users.iter().find(|su| {
+                    if let Some(profile) = &su.profile {
+                        if let Some(slack_email) = &profile.email {
+                            if *DEBUG_MODE {
+                                debug!(
+                                    "Comparing emails - Notion: '{}', Slack: '{}'",
+                                    email, slack_email
+                                );
+                                let matches = emails_match(email, slack_email);
+                                if matches {
+                                    debug!("Email match found!");
+                                }
+                                matches
+                            } else {
+                                emails_match(email, slack_email)
+                            }
+                        } else {
+                            if *DEBUG_MODE {
+                                debug!("Slack user {} has no email", su.name);
+                            }
+                            false
+                        }
+                    } else {
+                        if *DEBUG_MODE {
+                            debug!("Slack user {} has no profile", su.name);
+                        }
+                        false
+                    }
+                })
+            } else {
+                if *DEBUG_MODE {
+                    debug!("Notion user {} has no email", nu.name);
+                }
+                None
+            };
+
+            let user = User::new(slack_user.cloned(), Some(nu))
+                .expect("Failed to convert user from Notion");
+
+            if *DEBUG_MODE {
+                debug!("Created user: {} [{}]", user, user.system_presence());
+            }
+
+            user
         })
         .collect::<Vec<_>>();
+
+    if *DEBUG_MODE {
+        info!("Found {} combined users", combined_users.len());
+
+        // Log users that only exist in one system
+        let slack_only = combined_users
+            .iter()
+            .filter(|u| u.slack_user.is_some() && u.notion_user.is_none());
+        let notion_only = combined_users
+            .iter()
+            .filter(|u| u.slack_user.is_none() && u.notion_user.is_some());
+        let both = combined_users
+            .iter()
+            .filter(|u| u.slack_user.is_some() && u.notion_user.is_some());
+
+        info!("Users in both systems: {}", both.count());
+        info!("Users only in Slack: {}", slack_only.clone().count());
+        debug!(
+            "Slack only users: {:#?}",
+            slack_only.clone().collect::<Vec<_>>()
+        );
+        info!("Users only in Notion: {}", notion_only.clone().count());
+        debug!(
+            "Notion only users: {:#?}",
+            notion_only.clone().collect::<Vec<_>>()
+        );
+
+        // Log users without emails
+        let notion_without_email = combined_users
+            .iter()
+            .filter(|u| u.notion_user.is_some() && u.notion_user.as_ref().unwrap().person.is_none())
+            .count();
+        info!("Notion users without email: {}", notion_without_email);
+
+        // Log some examples of users without emails
+        if notion_without_email > 0 {
+            debug!("Examples of Notion users without email:");
+            for user in combined_users
+                .iter()
+                .filter(|u| {
+                    u.notion_user.is_some() && u.notion_user.as_ref().unwrap().person.is_none()
+                })
+                .take(5)
+            {
+                debug!("  - {}", user);
+            }
+        }
+    }
+
     let filtered_incidents = filter_incidents_for_review(incidents, "P2");
     println!("Reviewing {} recent incidents", filtered_incidents.len());
     let mut group_map = group_by_similar_title(filtered_incidents, 0.9);
