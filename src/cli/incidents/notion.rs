@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::str::FromStr;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::DEBUG_MODE;
 
@@ -105,7 +105,7 @@ pub struct NotionPerson {
     pub id: String,
     pub name: String,
     pub avatar_url: Option<String>,
-    pub person: NotionPersonDetails,
+    pub person: Option<NotionPersonDetails>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -135,34 +135,85 @@ impl Notion {
     pub async fn get_all_people(&self) -> Result<Vec<NotionPerson>> {
         let url = "https://api.notion.com/v1/users";
         let client = reqwest::Client::new();
+        let mut all_people = Vec::new();
+        let mut has_more = true;
+        let mut start_cursor: Option<String> = None;
 
-        let response = client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Notion-Version", "2022-06-28")
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
+        while has_more {
+            let mut request = client
+                .get(url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Notion-Version", "2022-06-28");
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Request failed with status: {}, response: {}",
-                response.status(),
-                response
-                    .text()
-                    .await
-                    .unwrap_or("no response text".to_owned())
-            ));
+            if let Some(ref cursor) = start_cursor {
+                request = request.query(&[("start_cursor", cursor)]);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "Request failed with status: {}, response: {}",
+                    response.status(),
+                    response
+                        .text()
+                        .await
+                        .unwrap_or("no response text".to_owned())
+                ));
+            }
+
+            let json_response = response.json::<serde_json::Value>().await?;
+
+            // Check if there are more results
+            has_more = json_response["has_more"].as_bool().unwrap_or(false);
+            if has_more {
+                start_cursor = json_response["next_cursor"].as_str().map(String::from);
+            }
+
+            // Extract people from this page
+            let people: Vec<NotionPerson> =
+                serde_json::from_value(json_response["results"].clone())
+                    .map(|s: Vec<NotionPerson>| {
+                        if *DEBUG_MODE {
+                            for person in &s {
+                                debug!(
+                                    "Notion person: id={}, name={}, has_person={}",
+                                    person.id,
+                                    person.name,
+                                    person.person.is_some()
+                                );
+                                if let Some(p) = &person.person {
+                                    debug!("  - email: {}", p.email);
+                                }
+                            }
+                        }
+                        s
+                    })
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize people: {}", e))?;
+
+            if *DEBUG_MODE {
+                info!("Retrieved {} people from Notion API", people.len());
+            }
+
+            all_people.extend(people);
         }
 
-        response
-            .json::<serde_json::Value>()
-            .await
-            .map(|v| {
-                serde_json::from_value::<Vec<NotionPerson>>(v["results"].clone())
-                    .expect("deserializing people")
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))
+        if *DEBUG_MODE {
+            info!("Total people retrieved from Notion: {}", all_people.len());
+
+            // Log statistics about people with/without email
+            let with_email = all_people.iter().filter(|p| p.person.is_some()).count();
+            let without_email = all_people.len() - with_email;
+            info!(
+                "Notion people with email: {}, without email: {}",
+                with_email, without_email
+            );
+        }
+
+        Ok(all_people)
     }
 
     /// Get the shape of the incident selection database to understand the data model
@@ -190,10 +241,12 @@ impl Notion {
                     "url": incident.html_url,
                 },
                 "PoC(s)": {
-                    "people": incident.poc_users.unwrap_or_else(|| panic!("no poc users for incident {}", incident.number)).iter().map(|u| {
-                        json!({
-                            "object": "user",
-                            "id": u.notion_user.as_ref().map(|u| u.id.clone()),
+                    "people": incident.poc_users.unwrap_or_else(|| panic!("no poc users for incident {}", incident.number)).iter().filter_map(|u| {
+                        u.notion_user.as_ref().map(|u| {
+                            json!({
+                                "object": "user",
+                                "id": u.id.clone(),
+                            })
                         })
                     }).collect::<Vec<_>>(),
                 },
